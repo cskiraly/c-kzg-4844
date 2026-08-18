@@ -160,6 +160,115 @@ static bool is_in_array(const uint64_t *arr, size_t arr_size, uint64_t value) {
 }
 
 /**
+ * Check that every cell of an aligned block is present in a cell availability bitmask.
+ *
+ * The aligned block (prefix, level) is the set of cells whose index shares the `level`-bit prefix
+ * `prefix`: the CELLS_PER_EXT_BLOB >> level consecutive cells starting at
+ * prefix * (CELLS_PER_EXT_BLOB >> level).
+ *
+ * @param[in]   supplied_mask   Bitmask with bit i set iff cell i was supplied,
+ *                              (CELLS_PER_EXT_BLOB + 63) / 64 words long
+ * @param[in]   prefix          The block's index prefix, below 2^level
+ * @param[in]   level           The block's level, the number of prefix bits
+ *
+ * @return True if every cell of the block is supplied, otherwise false.
+ */
+static bool aligned_block_is_supplied(const uint64_t *supplied_mask, uint64_t prefix, int level) {
+    uint64_t cells_in_block = CELLS_PER_EXT_BLOB >> level;
+    uint64_t first_cell = prefix * cells_in_block;
+    for (uint64_t cell = first_cell; cell < first_cell + cells_in_block; cell++) {
+        if (!(supplied_mask[cell / 64] & ((uint64_t)1 << (cell % 64)))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * Recover the extended data word from one complete aligned block of it.
+ *
+ * In the bit-reversed cell layout the cells sharing a k-bit index prefix p hold P's evaluations
+ * over one coset of a subgroup of the extended domain: w^bitrev_k(p) * H_k, where
+ * w = roots_of_unity[1] and H_k is the subgroup of order FIELD_ELEMENTS_PER_EXT_BLOB / 2^k. Such
+ * a block determines P outright -- no erasure coding involved -- whenever it holds at least
+ * FIELD_ELEMENTS_PER_BLOB points. At the current parameters those are exactly the two level-1
+ * blocks, the halves of the data word, whose coset representatives are s_0 = w^bitrev(0) = 1 (the
+ * blob's own domain, the even powers of w) and s_1 = w^bitrev(1) = w (its coset, the odd powers).
+ * This function decodes from one complete half:
+ *
+ *   - The supplied block already is its part of the codeword, so it is echoed to the output
+ *     verbatim. Recovery is exact and fr_t elements have a unique fully-reduced representation,
+ *     so this is bit-identical to recomputing it.
+ *   - A half-size inverse transform of the block's evaluations yields the coefficients of
+ *     P(s_block * x), where s_block is the block's coset representative.
+ *   - Scaling those coefficients by the powers of s_sibling / s_block turns them into the
+ *     coefficients of P(s_sibling * x), and one half-size forward transform of these evaluates
+ *     the sibling block. This is the same domain decomposition compute_cells_and_kzg_proofs uses
+ *     to compute the extension.
+ *
+ * @param[out]  reconstructed_data_out  Array of size FIELD_ELEMENTS_PER_EXT_BLOB to recover cells
+ * @param[in]   cells                   An array of size FIELD_ELEMENTS_PER_EXT_BLOB with the cells
+ * @param[in]   block                   The 1-bit prefix of the complete level-1 block
+ * @param[in]   s                       The trusted setup
+ *
+ * @remark `reconstructed_data_out` and `cells` can point to the same memory.
+ */
+static C_KZG_RET recover_cells_from_complete_block(
+    fr_t *reconstructed_data_out, const fr_t *cells, uint64_t block, const KZGSettings *s
+) {
+    C_KZG_RET ret;
+    fr_t *coeffs = NULL;
+    fr_t *evals = NULL;
+    const size_t half = FIELD_ELEMENTS_PER_EXT_BLOB / 2;
+    const uint64_t num_blocks = 2; /* the level-1 blocks */
+    const uint64_t sibling = block ^ 1;
+    const fr_t *supplied = cells + block * half;
+    fr_t *supplied_out = reconstructed_data_out + block * half;
+    fr_t *recomputed_out = reconstructed_data_out + sibling * half;
+
+    ret = new_fr_array(&coeffs, half);
+    if (ret != C_KZG_OK) goto out;
+    ret = new_fr_array(&evals, half);
+    if (ret != C_KZG_OK) goto out;
+
+    /* Take the supplied evaluations back to coefficient form, via natural domain order */
+    memcpy(evals, supplied, half * sizeof(fr_t));
+    ret = bit_reversal_permutation(evals, sizeof(fr_t), half);
+    if (ret != C_KZG_OK) goto out;
+    ret = fr_ifft(coeffs, evals, half, s);
+    if (ret != C_KZG_OK) goto out;
+
+    /*
+     * Move from the supplied block's coset to the sibling's: scaling the coefficients of
+     * P(s_block * x) by the powers of s_sibling / s_block gives those of P(s_sibling * x). Both
+     * representatives are powers of w, so their quotient is one table lookup away.
+     */
+    uint64_t block_rep = reverse_bits_limited(num_blocks, block);
+    uint64_t sibling_rep = reverse_bits_limited(num_blocks, sibling);
+    uint64_t shift_exp = (sibling_rep + FIELD_ELEMENTS_PER_EXT_BLOB - block_rep) %
+                         FIELD_ELEMENTS_PER_EXT_BLOB;
+    shift_poly(coeffs, half, &s->roots_of_unity[shift_exp]);
+
+    /* Evaluate over the sibling block's domain, back in bit-reversed order */
+    ret = fr_fft(evals, coeffs, half, s);
+    if (ret != C_KZG_OK) goto out;
+    ret = bit_reversal_permutation(evals, sizeof(fr_t), half);
+    if (ret != C_KZG_OK) goto out;
+
+    /*
+     * The two halves do not overlap even when reconstructed_data_out aliases cells, so the copies
+     * are safe in either order; memmove covers supplied_out == supplied.
+     */
+    memmove(supplied_out, supplied, half * sizeof(fr_t));
+    memcpy(recomputed_out, evals, half * sizeof(fr_t));
+
+out:
+    c_kzg_free(coeffs);
+    c_kzg_free(evals);
+    return ret;
+}
+
+/**
  * Given a set of cells with up to half the entries missing, return the reconstructed
  * original. Assumes that the inverse FFT of the original data has the upper half of its values
  * equal to zero.
@@ -182,6 +291,34 @@ C_KZG_RET recover_cells(
 ) {
     C_KZG_RET ret;
     uint64_t *missing_cell_indices = NULL;
+
+    /*
+     * Fast path: recover from a complete aligned block among the supplied cells.
+     *
+     * The general rule: in the bit-reversed layout the cells sharing a k-bit index prefix hold
+     * P's evaluations over one subgroup coset (see recover_cells_from_complete_block), so a
+     * complete such block holding at least FIELD_ELEMENTS_PER_BLOB points determines P by direct
+     * interpolation, making the whole vanishing-polynomial pipeline below unnecessary. At the
+     * current compile-time parameters exactly one level of proper blocks is that large: level 1,
+     * the two halves of the data word with FIELD_ELEMENTS_PER_BLOB points each. Deeper levels
+     * hold too few points to decode from, and the complete level-0 block (nothing missing at all)
+     * contains complete level-1 blocks, so checking level 1 covers everything. Recovery of any
+     * erasure pattern confined to one half, the single-missing-cell case in particular, thus
+     * costs the same as computing the extension.
+     *
+     * The caller has validated cell_indices, so the mask build cannot index out of bounds.
+     */
+    uint64_t supplied_mask[(CELLS_PER_EXT_BLOB + 63) / 64] = {0};
+    for (size_t i = 0; i < num_cells; i++) {
+        supplied_mask[cell_indices[i] / 64] |= (uint64_t)1 << (cell_indices[i] % 64);
+    }
+    const int level = 1;
+    for (uint64_t block = 0; block < ((uint64_t)1 << level); block++) {
+        if (aligned_block_is_supplied(supplied_mask, block, level)) {
+            return recover_cells_from_complete_block(reconstructed_data_out, cells, block, s);
+        }
+    }
+
     fr_t *short_vanishing_poly = NULL;
     fr_t *short_vanishing_poly_eval = NULL;
     fr_t *vanishing_poly_over_coset = NULL;

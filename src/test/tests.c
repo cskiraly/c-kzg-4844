@@ -2055,13 +2055,24 @@ static void test_recover_cells__succeeds_every_erasure_count(void) {
     /*
      * Recovery cost does not depend on how much is missing, so a single erasure count is not
      * evidence about the others. Sweep all of them, from one missing cell to the maximum, as a
-     * prefix, a suffix and a strided pattern.
+     * prefix, a suffix, a strided pattern, and a strided pattern confined to each half.
      *
      * The strided and maximum-erasure cases matter in particular: the vanishing polynomial reaches
      * its full degree only when exactly CELLS_PER_BLOB cells are missing.
+     *
+     * The modes also pin down the complete-aligned-block fast path in recover_cells for both
+     * level-1 blocks:
+     *   - modes 0 and 3 (prefix / strided within the first half) leave block 1 (the coset half)
+     *     complete, so they exercise decoding from block 1, with the w^-1 shift to its sibling;
+     *   - modes 1 and 4 (suffix / strided within the second half) leave block 0 (the subgroup
+     *     half) complete, so they exercise decoding from block 0, with the w shift;
+     *   - mode 2 erases from both halves for every k >= 2 (k = 1 erases only cell 0), so it is
+     *     the mode that exercises the general vanishing-polynomial pipeline.
+     * Both blocks are hit at every erasure count, including the single-missing-cell case in each
+     * half (k = 1, modes 3 and 4) and a fully missing half (k = CELLS_PER_BLOB, modes 3 and 4).
      */
     for (size_t k = 1; k <= CELLS_PER_BLOB; k++) {
-        for (int mode = 0; mode < 3; mode++) {
+        for (int mode = 0; mode < 5; mode++) {
             for (size_t c = 0; c < CELLS_PER_EXT_BLOB; c++) {
                 is_missing[c] = false;
             }
@@ -2071,8 +2082,12 @@ static void test_recover_cells__succeeds_every_erasure_count(void) {
                     idx = j;
                 } else if (mode == 1) {
                     idx = CELLS_PER_EXT_BLOB - 1 - j;
-                } else {
+                } else if (mode == 2) {
                     idx = (j * CELLS_PER_EXT_BLOB) / k;
+                } else if (mode == 3) {
+                    idx = (j * (CELLS_PER_EXT_BLOB / 2)) / k;
+                } else {
+                    idx = CELLS_PER_EXT_BLOB / 2 + (j * (CELLS_PER_EXT_BLOB / 2)) / k;
                 }
                 is_missing[idx] = true;
             }
